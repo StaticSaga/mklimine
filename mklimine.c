@@ -87,7 +87,8 @@ void init_bcat(u8 *iso, usiz bcat_sec, usiz bioscd_sec, usiz bioscd_len, usiz ef
     ent->boot_indicator = 0x88; ent->boot_media = 0; ent->segment = 0; ent->sys_type = 0;
     ent->sec_count = efi_secs; ent->load_rba = efi_sec;
 }
-dir_record *init_dir(u8 *iso, usiz dirs_sec, usiz dir_secs, dir_record *parent) {
+
+usiz init_dir(u8 *iso, usiz dirs_sec, usiz dir_secs, dir_record *parent) {
     pvd_datetime pvd_date; dir_datetime dir_date; date(&pvd_date, &dir_date);
     
     u32 parent_sec = parent ? parent[0].extent_lba.native : dirs_sec, parent_secs = parent ? parent[0].data_len.native / 2048 : dir_secs;
@@ -101,15 +102,26 @@ dir_record *init_dir(u8 *iso, usiz dirs_sec, usiz dir_secs, dir_record *parent) 
     ((u8 *)dirs + sizeof(dir_record))[0] = 1;
     dirs = (void*)((uptr)dirs + dirs->len);
 
-    return dirs;
+    return dirs_sec * 2048 + (sizeof(dir_record) + 1) * 2;
 }
-void dir_entry(u8 *iso, dir_record **dirs, const char *name, u32 data_lba, u32 data_secs, ent_flags flags) {
+
+void dir_entry(u8 *iso, usiz *dir_offset, const char *name, u32 data_lba, u32 data_secs, ent_flags flags) {
     pvd_datetime pvd_date; dir_datetime dir_date; date(&pvd_date, &dir_date);
-    u8 name_len = strlen(name) + 2; // add ;1
-    **dirs = (dir_record) { .flags = flags, .len = sizeof(dir_record) + name_len, .extent_lba = b32(data_lba), .data_len = b32(data_secs), .volume_seq = b16(1), .fname_len = name_len, .recinfo = dir_date };
-    memcpy((u8 *)(*dirs) + sizeof(dir_record), name, name_len);
-    memcpy((u8 *)(*dirs) + sizeof(dir_record) + name_len - 2, ";1", 2);
-    *dirs = (void*)((uptr)(*dirs) + (*dirs)->len);
+    u8 name_len = strlen(name), nameent_len = name_len + 2, padding = (sizeof(dir_record) + name_len) ? 1 : 0, rrip_len = sizeof(susp_entry) + 1 + name_len;
+    u8 total_len = sizeof(dir_record) + nameent_len + padding + rrip_len;
+    if (sec_roundup(*dir_offset) != sec_roundup(*dir_offset + total_len)) *dir_offset = sec_roundup(*dir_offset);
+    dir_record *dir = (void*)(iso + *dir_offset);
+
+    *dir = (dir_record) { .flags = flags, .len = total_len, .extent_lba = b32(data_lba), .data_len = b32(data_secs), .volume_seq = b16(1), .fname_len = nameent_len, .recinfo = dir_date };
+    u8 *data = (u8 *)dir + sizeof(dir_record);
+    memcpy(data, name, name_len);
+    memcpy(data + nameent_len, ";1", 2);
+    susp_entry *e = (void*)(data + nameent_len + padding);
+    memcpy(e->sig, "NM", 2);
+    e->len_sue = rrip_len; e->ver = 1;
+    e->data[0] = 0; // flags
+    memcpy(e->data + 1, name, name_len);
+    *dir_offset += total_len;
 }
 
 // isohybrid
@@ -165,7 +177,7 @@ void finfo(file_info *out, const char *dir, const char *name, usiz namelen, cons
     }
     out->size = ftell(out->fp);
     rewind(out->fp);
-    *cur_lba += sec_len(out->size);
+    *cur_lba += sec_roundup(out->size);
 }
 
 // main
@@ -176,14 +188,16 @@ void usage() {
         "Example: mklimine myos.iso build/limine-bin src/limine.cfg:limine.cfg build/kernel.elf:kernel.elf\n");
     exit(EXIT_FAILURE);
 }
+
 const int ROUNDING = 8 * 4096;
 int main(const int argc, const char **argv) {
-    if (argc <= 3) usage();
+    if (argc <= 2) usage();
     const char *output = argv[1], *dir = argv[2];
     usiz user_files = argc - 3, sys_files = 4;
     usiz files = user_files + sys_files;
     file_info *info = malloc(files * sizeof(file_info));
-
+    if (!info) { fprintf(stderr, "Allocation error\n"); exit(EXIT_FAILURE); }
+    
     usiz cur = lba_free;
     finfo(info + idx_efi, dir, PTR_LEN("limine-eltorito-efi.bin"), NULL, &cur);
     finfo(info + idx_sys, dir, PTR_LEN("limine.sys"), "limine.sys", &cur);
@@ -198,39 +212,33 @@ int main(const int argc, const char **argv) {
 
     usiz dirs_sec = cur, dirs_size = 0;
     dirs_size += DIR_SIZE;
-    dirs_size += DIR_ENT8_3_SIZE * (user_files + 1); // add limine.sys
-    cur += sec_len(dirs_size);
+    dirs_size += DIR_ENT30_SIZE * (user_files + 1); // add limine.sys
+    cur += sec_roundup(dirs_size);
     
     usiz size = cur * 2048;
     size += ((size % ROUNDING) != 0) ? ROUNDING - (size % ROUNDING) : 0;
 
     u8 *iso = calloc(size, 1);
+    if (!iso) { fprintf(stderr, "Allocation error\n"); exit(EXIT_FAILURE); }
 
-    dir_record *root = init_dir(iso, dirs_sec, sec_len(dirs_size), NULL);
+    usiz root_off = init_dir(iso, dirs_sec, sec_roundup(dirs_size), NULL);
     for (usiz i = 0; i < files; i++) {
         file_info in = info[i]; 
         if (fread(iso + in.start_lba * 2048, in.size, 1, in.fp) != 1) {
-            fprintf(stderr, "Read error\n");
-            exit(EXIT_FAILURE);
+            fprintf(stderr, "Read error\n"); exit(EXIT_FAILURE);
         }
         fclose(in.fp);
-        if (in.isoname != NULL) dir_entry(iso, &root, in.isoname, in.start_lba, in.size, (i == idx_sys) ? ent_hidden : 0);
+        if (in.isoname != NULL) dir_entry(iso, &root_off, in.isoname, in.start_lba, in.size, (i == idx_sys) ? ent_hidden : 0);
     }
 
     init_mbr(iso, size, info[idx_cd].start_lba, info[idx_cd].size);
     init_gpt(iso, info[idx_efi].start_lba, info[idx_efi].size);
-    init_pvd(iso, lba_pvd, size, dirs_sec, sec_len(dirs_size));
+    init_pvd(iso, lba_pvd, size, dirs_sec, sec_roundup(dirs_size));
     init_bootrec(iso, lba_bootrec, lba_bcat);
     init_terminator(iso, lba_terminator);
     init_bcat(iso, lba_bcat, info[idx_cd].start_lba, info[idx_cd].size, info[idx_efi].start_lba, (info[idx_efi].size + 511) / 512, lba_pvd);
 
     FILE *isofile = fopen(output, "wb");
-    if (isofile == NULL) {
-        fprintf(stderr, "Can't open output file\n");
-        exit(EXIT_FAILURE);
-    }
-    if (fwrite(iso, size, 1, isofile) != 1) {
-        fprintf(stderr, "Error while writing the ISO\n");
-        exit(EXIT_FAILURE);
-    }
+    if (isofile == NULL) { fprintf(stderr, "Can't open output file\n"); exit(EXIT_FAILURE); }
+    if (fwrite(iso, size, 1, isofile) != 1) { fprintf(stderr, "Error while writing the ISO\n"); exit(EXIT_FAILURE); }
 }

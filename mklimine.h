@@ -23,6 +23,12 @@ typedef struct dir_datetime {
 
 typedef enum { ent_normal = 0, ent_hidden = 1 << 0 } ent_flags;
 
+typedef struct susp_entry {
+    char sig[2];
+    u8 len_sue, ver;
+    u8 data[];
+} susp_entry;
+
 typedef struct dir_record {
 	u8 len, extlen;
 	both32 extent_lba, data_len;
@@ -31,8 +37,9 @@ typedef struct dir_record {
 	both16 volume_seq;
 	u8 fname_len;
 } dir_record;
+
 const usiz DIR_SIZE = sizeof(dir_record) + 1; // dot and dotdot
-const usiz DIR_ENT8_3_SIZE = sizeof(dir_record) + 14; // ABCDEFGH.ABC;1
+const usiz DIR_ENT30_SIZE = sizeof(dir_record) + 30 + 2 + sizeof(susp_entry) + 1 + 30; // 30 characters max, Rock Ridge
 
 typedef enum used_sectors { lba_pvd = 16, lba_bootrec, lba_terminator, lba_bcat, lba__, lba_free } used_sectors;
 
@@ -120,7 +127,7 @@ typedef struct gpt_ent {
 const u8 esp_guid[16] = {0x28, 0x73, 0x2A, 0xC1, 0x1F, 0xF8, 0xD2, 0x11, 0xBA, 0x4B, 0x00, 0xA0, 0xC9, 0x3E, 0xC9, 0x3B };
 
 typedef enum { idx_efi = 0, idx_sys, idx_cd, idx_hdd } sys_files;
-static inline usiz sec_len(usiz len) { return (len + 2047) / 2048; }
+static inline usiz sec_roundup(usiz len) { return (len + 2047) / 2048; }
 
 static inline u32 crc32(const void *data, usiz siz) {
     const u8 *stream = (const u8*)data;
